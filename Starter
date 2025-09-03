@@ -90,37 +90,48 @@ select
 from KDIGO_Baseline_YTD b
 join KDIGO_Peak_YTD p using (EncounterKey);
 
-/* N1: Notes (windowed & ≤60d) */
+/* ========================
+   N1: Notes Context (last 60d, peri-exposure, focused services)
+   ======================== */
 create or replace temp view Notes_Context_YTD as
 select
     cnf.EncounterKey,
-    coalesce(cnf.SignedInstant, cnf.EntryInstant, cnf.NoteInstant) as NoteInstant,
-    cnd.ClinicalNoteTypeName,
-    pd.ProviderTypeName as AuthorType,
+    dd.DateValue as NoteDate,             -- from LastEditedDateKey
+    cnf.ClinicalNoteKey,
+    pd.ProviderTypeName as AuthorType,    -- via DurableKey (IsCurrent=1)
+    cnf.Service,
     substr(cntf.NoteText, 1, 400) as NotePreview
 from ClinicalNoteFact cnf
-join ClinicalNoteDim cnd
-  on cnf.ClinicalNoteKey = cnd.ClinicalNoteKey
-left join ClinicalNoteTextFact cntf
+join ClinicalNoteTextFact cntf
   on cnf.ClinicalNoteKey = cntf.ClinicalNoteKey
+join DateDim dd
+  on cnf.LastEditedDateKey = dd.DateKey
 left join ProviderDim pd
-  on cnf.AuthorProviderKey = pd.ProviderKey
-join NTX_COHORT_YTD c using (EncounterKey)
-where coalesce(cnf.SignedInstant, cnf.EntryInstant, cnf.NoteInstant)
-      >= dateadd(day, -60, current_date)
-  and coalesce(cnf.SignedInstant, cnf.EntryInstant, cnf.NoteInstant)
-      between dateadd(day,-7, c.First_Dose_Instant)
-          and dateadd(day,14, c.Last_Dose_Instant)
-  and cnd.ClinicalNoteTypeName ilike any (array[
-       '%nephro%', '%pharmacy%', '%progress%', '%consult%',
-       '%ICU%', '%PICU%', '%nursing%', '%ED%', '%discharge%',
-       '%respiratory%', '%procedure%'
-  ])
-  and pd.ProviderTypeName ilike any (array[
-       '%Nephrologist%', '%Pharmacist%', '%Hospitalist%', '%Intensivist%',
-       '%Resident%', '%APP%', '%RN%', '%RT%', '%ED Physician%',
-       '%Surgeon%', '%Anesthesiologist%'
-  ]);
+  on cnf.AuthoringProviderDurableKey = pd.DurableKey
+ and pd.IsCurrent = 1
+join NTX_COHORT_YTD c
+  on cnf.EncounterKey = c.EncounterKey
+where dd.DateValue >= dateadd(day, -60, current_date)
+  and dd.DateValue between dateadd(day, -7, cast(c.First_Dose_Instant as date))
+                      and dateadd(day, 14, cast(c.Last_Dose_Instant  as date))
+  and (
+       cnf.Service ilike 'Infectious Disease'
+    or cnf.Service ilike 'Nephrology'
+    or cnf.Service ilike 'Pharmacy'
+    or cnf.Service ilike 'Critical Care Serv'
+    or cnf.Service ilike 'Cardiac Intensive Care Unit'
+    or cnf.Service ilike 'Pediatric Hospital Medicine'
+    or cnf.Service ilike 'Emergency Dept'
+    or cnf.Service ilike 'Oncology'
+    or cnf.Service ilike 'Hematology Oncology'
+    or cnf.Service ilike 'Cardiology'
+    or cnf.Service ilike 'CV Surgery'
+    or cnf.Service ilike 'Interventional Radiology'
+    or cnf.Service ilike 'Medical Imaging'
+    or cnf.Service ilike 'Neonatology'
+    or cnf.Service ilike 'Heart Failure'
+  );
+
 
 /* Final view */
 create or replace view NTX_AKI_With_Context as
