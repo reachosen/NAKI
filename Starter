@@ -1,0 +1,138 @@
+/* M0: Cohort (last 60 days) */
+create or replace temp table NTX_COHORT_YTD as
+select
+    ma.EncounterKey,
+    min(ma.AdminInstant) as First_Dose_Instant,
+    max(ma.AdminInstant) as Last_Dose_Instant
+from MedicationAdministrationFact ma
+join MedicationDim md
+  on ma.MedicationKey = md.MedicationKey
+where ma.AdminInstant >= dateadd(day, -60, current_date)
+  and md.MedicationName ilike any (array[
+        '%gentamicin%', '%tobramycin%', '%amikacin%',
+        '%vancomycin%', '%acyclovir%', '%amphotericin%',
+        '%ibuprofen%', '%ketorolac%'
+  ])
+group by ma.EncounterKey;
+
+/* M1: Labs (last 60 days) */
+create or replace temp table Labs_Inputs_YTD as
+select
+    lcr.EncounterKey,
+    lcd.LabComponentName,
+    lcr.ResultInstant,
+    lcr.NumericValue,
+    lcr.Value as TextResult,
+    lcr.Unit
+from LabComponentResult lcr
+join LabComponentDim lcd
+  on lcr.LabComponentKey = lcd.LabComponentKey
+where lcr.EncounterKey in (select EncounterKey from NTX_COHORT_YTD)
+  and lcr.ResultInstant >= dateadd(day, -60, current_date)
+  and lcd.LabComponentName ilike any (array[
+        '%creatinine%', '%bun%', '%cystatin%',
+        '%gentamicin level%', '%tobramycin level%',
+        '%amikacin level%', '%vancomycin level%'
+  ]);
+
+/* K1: SCr series (windowed & ≤60d) */
+create or replace temp view KDIGO_SCr_Series_YTD as
+select
+    l.EncounterKey,
+    l.ResultInstant,
+    coalesce(try_to_decimal(l.NumericValue),
+             try_to_decimal(l.TextResult)) as SCr_mg_dL,
+    l.Unit
+from Labs_Inputs_YTD l
+join NTX_COHORT_YTD c using (EncounterKey)
+where l.LabComponentName ilike '%creatinine%'
+  and l.ResultInstant >= dateadd(day, -60, current_date)
+  and l.ResultInstant between dateadd(day,-7, c.First_Dose_Instant)
+                          and dateadd(day,14, c.Last_Dose_Instant);
+
+/* K2: Baseline */
+create or replace temp view KDIGO_Baseline_YTD as
+select EncounterKey, min(SCr_mg_dL) as Baseline_SCr
+from KDIGO_SCr_Series_YTD
+group by EncounterKey;
+
+/* K3: First abnormal */
+create or replace temp view KDIGO_FirstAbnormal_YTD as
+select distinct
+    s.EncounterKey,
+    min_by(s.ResultInstant, s.SCr_mg_dL) as First_Abnormal_Instant
+from KDIGO_SCr_Series_YTD s
+join KDIGO_Baseline_YTD b using (EncounterKey)
+where (s.SCr_mg_dL - b.Baseline_SCr) >= 0.3
+   or  s.SCr_mg_dL >= (b.Baseline_SCr * 1.5)
+group by s.EncounterKey;
+
+/* K4: Peak */
+create or replace temp view KDIGO_Peak_YTD as
+select EncounterKey, max(SCr_mg_dL) as Peak_SCr
+from KDIGO_SCr_Series_YTD
+group by EncounterKey;
+
+/* K5: Stage */
+create or replace temp view KDIGO_Stage_YTD as
+select
+    b.EncounterKey,
+    b.Baseline_SCr,
+    p.Peak_SCr,
+    case
+        when p.Peak_SCr >= b.Baseline_SCr * 3
+          or p.Peak_SCr >= 4.0 then 3
+        when p.Peak_SCr >= b.Baseline_SCr * 2 then 2
+        when p.Peak_SCr >= b.Baseline_SCr * 1.5
+          or (p.Peak_SCr - b.Baseline_SCr) >= 0.3 then 1
+        else 0
+    end as KDIGO_Stage
+from KDIGO_Baseline_YTD b
+join KDIGO_Peak_YTD p using (EncounterKey);
+
+/* N1: Notes (windowed & ≤60d) */
+create or replace temp view Notes_Context_YTD as
+select
+    cnf.EncounterKey,
+    coalesce(cnf.SignedInstant, cnf.EntryInstant, cnf.NoteInstant) as NoteInstant,
+    cnd.ClinicalNoteTypeName,
+    pd.ProviderTypeName as AuthorType,
+    substr(cntf.NoteText, 1, 400) as NotePreview
+from ClinicalNoteFact cnf
+join ClinicalNoteDim cnd
+  on cnf.ClinicalNoteKey = cnd.ClinicalNoteKey
+left join ClinicalNoteTextFact cntf
+  on cnf.ClinicalNoteKey = cntf.ClinicalNoteKey
+left join ProviderDim pd
+  on cnf.AuthorProviderKey = pd.ProviderKey
+join NTX_COHORT_YTD c using (EncounterKey)
+where coalesce(cnf.SignedInstant, cnf.EntryInstant, cnf.NoteInstant)
+      >= dateadd(day, -60, current_date)
+  and coalesce(cnf.SignedInstant, cnf.EntryInstant, cnf.NoteInstant)
+      between dateadd(day,-7, c.First_Dose_Instant)
+          and dateadd(day,14, c.Last_Dose_Instant)
+  and cnd.ClinicalNoteTypeName ilike any (array[
+       '%nephro%', '%pharmacy%', '%progress%', '%consult%',
+       '%ICU%', '%PICU%', '%nursing%', '%ED%', '%discharge%',
+       '%respiratory%', '%procedure%'
+  ])
+  and pd.ProviderTypeName ilike any (array[
+       '%Nephrologist%', '%Pharmacist%', '%Hospitalist%', '%Intensivist%',
+       '%Resident%', '%APP%', '%RN%', '%RT%', '%ED Physician%',
+       '%Surgeon%', '%Anesthesiologist%'
+  ]);
+
+/* Final view */
+create or replace view NTX_AKI_With_Context as
+select
+  k5.EncounterKey,
+  k5.Baseline_SCr,
+  k5.Peak_SCr,
+  k5.KDIGO_Stage,
+  n.NoteInstant,
+  n.ClinicalNoteTypeName,
+  n.AuthorType,
+  n.NotePreview
+from KDIGO_Stage_YTD k5
+left join Notes_Context_YTD n
+  on k5.EncounterKey = n.EncounterKey;
